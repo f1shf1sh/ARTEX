@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ARTEX 安装脚本：① 全部 Docker  ② 本地编译运行
+# ARTEX 安装脚本：① 全部 Docker（本地构建镜像）② 本地编译运行
 set -euo pipefail
 cd "$(cd "$(dirname "$0")" && pwd)"
 
@@ -30,7 +30,57 @@ ensure_docker(){
   esac
 }
 
-# ── ① 全部 Docker ───────────────────────────────
+# ── ① 全部 Docker（本地构建镜像）────────────────
+# 检测 Docker daemon 的架构，映射成 Go / 镜像用的 GOARCH。
+detect_linux_arch(){
+  local a
+  a="$(docker info --format '{{.Architecture}}' 2>/dev/null || true)"
+  [ -n "$a" ] || a="$(uname -m)"
+  case "$a" in
+    x86_64|amd64)  echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    *) die "不支持的宿主机架构：$a（仅支持 amd64 / arm64）" ;;
+  esac
+}
+
+# 在宿主机上构建前端 + Linux 单二进制，再交给 Dockerfile 打成运行镜像。
+# Dockerfile 不负责编译，只 COPY dist/<TARGETARCH>/artex，所以这里必须先生成它。
+build_image(){
+  command -v go >/dev/null 2>&1 || die "本地构建镜像需要 Go（>=1.26）：https://go.dev/dl/"
+  command -v npm >/dev/null 2>&1 || die "本地构建镜像需要 Node.js/npm（构建内嵌前端）"
+  local arch ver
+  arch="$(detect_linux_arch)"
+  ver="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"; ver="${ver#v}"
+
+  info "构建前端静态产物（npm ci + build:static）…"
+  ( cd web && npm ci && npm run build:static )
+  mkdir -p server/webui
+  rm -rf server/webui/dist
+  cp -R web/out server/webui/dist
+
+  info "交叉编译 Linux/${arch} 单二进制（版本 ${ver}）…"
+  mkdir -p "dist/${arch}"
+  CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" \
+    go build -tags embedui -trimpath \
+    -ldflags "-s -w -buildid= -X main.version=${ver}" \
+    -o "dist/${arch}/artex" ./cmd/artex
+
+  info "构建本地镜像 autumn27/artex:local（首次会拉取基础镜像，需要联网）…"
+  docker build -t autumn27/artex:local .
+  ok "本地镜像已构建：autumn27/artex:local"
+}
+
+# 写入/更新 .env 中的单个键，避免重复行。
+set_env(){
+  local k="$1" v="$2"
+  if grep -q "^${k}=" .env; then
+    sed -i.bak "s|^${k}=.*|${k}=${v}|" .env
+    rm -f .env.bak
+  else
+    printf '%s=%s\n' "$k" "$v" >> .env
+  fi
+}
+
 install_docker(){
   ensure_docker
   if [ ! -f .env ]; then
@@ -45,10 +95,15 @@ install_docker(){
   else
     info "沿用已存在的 .env"
   fi
-  info "拉取镜像并启动…"
-  docker compose pull || true
+
+  build_image
+  # 固定使用本地构建的 tag，compose 就不会去 Docker Hub 拉 autumn27/artex:latest。
+  set_env ARTEX_TAG local
+
+  info "启动容器…"
   docker compose up -d
   ok "启动完成 → http://localhost:8787"
+  info "镜像由本地源码构建（artex:local）；代码更新后重跑本脚本即可重建"
   info "查看日志：docker compose logs -f artex"
 }
 
@@ -97,6 +152,7 @@ JSON
   if command -v npm >/dev/null 2>&1; then
     info "构建前端静态产物…"
     ( cd web && npm ci && npm run build:static )
+    mkdir -p server/webui
     rm -rf server/webui/dist && cp -r web/out server/webui/dist
     info "编译内嵌单二进制…"
     CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
@@ -112,7 +168,7 @@ JSON
 
 echo "=============================="
 echo "  ARTEX 安装"
-echo "  1) 全部 Docker 安装"
+echo "  1) 全部 Docker 安装（从源码本地构建镜像）"
 echo "  2) 本地运行（go 编译）"
 echo "=============================="
 case "$(ask '选择' 1)" in
